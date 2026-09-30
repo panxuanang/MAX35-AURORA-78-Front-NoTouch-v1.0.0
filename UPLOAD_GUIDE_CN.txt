@@ -1,0 +1,33 @@
+MAX35 AURORA 前摄无触摸版 - 上传与编译
+========================================
+
+目标硬件：
+ESP32S3-MAX35-LCD-FCamera-Case
+前摄像头 / 无触摸 / 带外壳
+
+1. 解压本文件。
+2. 在 GitHub 新建空仓库。
+3. 把解压后的全部内容上传到仓库根目录。
+   注意：必须包含隐藏目录 .github/workflows/。
+4. 打开 GitHub 仓库 -> Actions。
+5. 选择 “Build MAX35 AURORA Front NoTouch”。
+6. 点击 “Run workflow”。upstream_ref 保持 main。
+7. 构建成功后，在页面底部下载：
+   MAX35-AURORA-Front-NoTouch-Firmware
+8. 解压 artifact，找到：
+   MAX35_AURORA_FRONT_<版本>_merged-binary.bin
+9. 第一次从旧固件切过来，建议先 erase flash。
+10. merged-binary.bin 从 0x0 烧录。
+
+本版本特性：
+- 当前 78/xiaozhi 软件栈
+- SpotPear MAX35 硬件层
+- GC0308 前摄
+- 270 度摄像头旋转
+- 无触摸依赖
+- 对话自动进入聊天页
+- 长回答完整换行
+- 超长回答延时后慢速滚动到末尾
+- 不添加旧 STELLAR 的 Todo / 天气 / 触摸快门 / 产品 MCP 工具
+
+如果 Actions 编译失败，请把失败步骤从第一个 ERROR 开始的日志发给我。

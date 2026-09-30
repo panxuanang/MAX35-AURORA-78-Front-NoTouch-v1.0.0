@@ -1,0 +1,185 @@
+name: Build MAX35 AURORA Front NoTouch
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "78/xiaozhi-esp32 ref (main recommended)"
+        required: false
+        default: "main"
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'overlay/**'
+      - 'scripts/**'
+      - '.github/workflows/build-max35-front.yml'
+      - 'VERSION'
+
+permissions:
+  contents: read
+
+env:
+  # Same public SpotPear MAX35 source package used by the proven rear-camera project.
+  SPOTPEAR_DRIVE_ID: 1WIrLLpS7OxHll7KD5v6kePZM50hAtzlf
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: espressif/idf:v6.1
+
+    steps:
+      - name: Checkout AURORA product overlay
+        uses: actions/checkout@v5
+        with:
+          path: product
+
+      - name: Checkout current 78/xiaozhi-esp32
+        uses: actions/checkout@v5
+        with:
+          repository: 78/xiaozhi-esp32
+          ref: ${{ github.event.inputs.upstream_ref || 'main' }}
+          path: xiaozhi
+          submodules: recursive
+
+      - name: Prepare ESP-IDF 6.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$IDF_PATH/export.sh"
+          idf.py --version
+          python --version
+          python -m pip install --disable-pip-version-check --no-cache-dir gdown
+
+      - name: Download SpotPear MAX35 vendor hardware source
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$IDF_PATH/export.sh"
+          rm -rf vendor-src /tmp/spotpear.zip
+          mkdir -p vendor-src
+          python -m gdown "${SPOTPEAR_DRIVE_ID}" -O /tmp/spotpear.zip
+          python - <<'PY'
+          import zipfile
+          p = '/tmp/spotpear.zip'
+          if not zipfile.is_zipfile(p):
+              raise SystemExit('SpotPear source download is not a ZIP')
+          print('SpotPear source ZIP: OK')
+          PY
+          unzip -q /tmp/spotpear.zip -d vendor-src
+          VENDOR_ROOT="$(python product/scripts/find_source_root.py vendor-src)"
+          echo "VENDOR_ROOT=$VENDOR_ROOT" >> "$GITHUB_ENV"
+          echo "Vendor source root: $VENDOR_ROOT"
+
+      - name: Import front MAX35 hardware into current 78 stack
+        shell: bash
+        env:
+          # Optional repository variable, e.g. https://your-server/xiaozhi/ota/
+          XIAOZHI_OTA_URL: ${{ vars.XIAOZHI_OTA_URL }}
+        run: |
+          set -euo pipefail
+          . "$IDF_PATH/export.sh"
+          python product/scripts/import_max35_front_to_78.py \
+            --vendor "$VENDOR_ROOT" \
+            --upstream xiaozhi \
+            --product product
+          python product/scripts/preflight.py xiaozhi
+
+      - name: Verify IDF 6 camera and ADC migration
+        shell: bash
+        run: |
+          set -euo pipefail
+          BOARD=xiaozhi/main/boards/spotpear/max35-front
+          if grep -RInE '#[[:space:]]*include[[:space:]]*[<"]driver/(deprecated/driver/)?adc\.h[>"]' "$BOARD"; then
+            echo 'ERROR: legacy driver/adc.h survived the import'
+            exit 1
+          fi
+          test -f "$BOARD/legacy_adc_compat.h"
+          grep -q 'adc_oneshot_read' "$BOARD/legacy_adc_compat.h"
+          if grep -RInE 'new[[:space:]]+Esp32Camera[[:space:]]*\([[:space:]]*video_config[[:space:]]*\)' "$BOARD"; then
+            echo 'ERROR: old SpotPear Esp32Camera(video_config) wrapper survived'
+            exit 1
+          fi
+          grep -RInF '#include "esp_video.h"' "$BOARD"
+          grep -RInF 'new EspVideo(video_config)' "$BOARD"
+          echo '[OK] vendor MAX35 hardware migrated to current 78 APIs'
+
+      - name: List imported board
+        shell: bash
+        working-directory: xiaozhi
+        run: |
+          set -euo pipefail
+          . "$IDF_PATH/export.sh"
+          python scripts/build.py --list-boards | grep -A2 -B1 'spotpear/max35-front'
+
+      - name: Build front camera firmware
+        shell: bash
+        working-directory: xiaozhi
+        env:
+          XIAOZHI_BUILD_STAGES: "1"
+        run: |
+          set -euo pipefail
+          . "$IDF_PATH/export.sh"
+          python scripts/build.py spotpear/max35-front --name max35-front-gc0308
+
+      - name: Verify final front/no-touch configuration
+        shell: bash
+        working-directory: xiaozhi
+        run: |
+          set -euo pipefail
+          test -f build/merged-binary.bin
+          grep -q '^CONFIG_BOARD_TYPE_SPOTPEAR_MAX35_FRONT=y$' sdkconfig
+          grep -q '^CONFIG_CAMERA_GC0308=y$' sdkconfig
+          grep -q '^CONFIG_ESP_VIDEO_ENABLE_DVP_VIDEO_DEVICE=y$' sdkconfig
+          grep -q '^CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE=y$' sdkconfig
+          grep -q '^CONFIG_XIAOZHI_CAMERA_IMAGE_ROTATION_ANGLE_270=y$' sdkconfig
+          if grep -q '^CONFIG_XIAOZHI_CAMERA_IMAGE_ROTATION_ANGLE_90=y$' sdkconfig; then
+            echo 'ERROR: rear-camera 90-degree rotation is enabled'
+            exit 1
+          fi
+          if grep -Eq '^CONFIG_CAMERA_(OV2640|OV5640).*=(y|1)$' sdkconfig; then
+            echo 'ERROR: a non-GC0308 sensor is enabled'
+            grep -E '^CONFIG_CAMERA_(OV2640|OV5640)' sdkconfig || true
+            exit 1
+          fi
+          echo 'Final camera config:'
+          grep -E '^(CONFIG_CAMERA_GC0308|CONFIG_ESP_VIDEO_ENABLE_DVP|CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA|CONFIG_XIAOZHI_CAMERA_IMAGE_ROTATION)' sdkconfig || true
+
+      - name: Package firmware artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '\r\n' < product/VERSION)"
+          mkdir -p product/dist
+          cp xiaozhi/build/merged-binary.bin "product/dist/MAX35_AURORA_FRONT_${VERSION}_merged-binary.bin"
+          cp xiaozhi/build/flasher_args.json product/dist/ 2>/dev/null || true
+          cp xiaozhi/build/project_description.json product/dist/ 2>/dev/null || true
+          cp xiaozhi/sdkconfig product/dist/sdkconfig.final 2>/dev/null || true
+          (
+            cd product/dist
+            sha256sum *.bin > SHA256SUMS.txt
+          )
+          {
+            echo "product_version=$VERSION"
+            echo "hardware=ESP32S3-MAX35-LCD-FCamera-Case"
+            echo "camera=front-gc0308"
+            echo "camera_rotation=270"
+            echo "touch=none"
+            echo "upstream=78/xiaozhi-esp32"
+            echo "upstream_ref=${{ github.event.inputs.upstream_ref || 'main' }}"
+            echo "upstream_commit=$(git -C xiaozhi rev-parse HEAD)"
+            echo "idf=$(bash -lc '. \"$IDF_PATH/export.sh\" >/dev/null 2>&1; idf.py --version' || true)"
+            echo "board=spotpear/max35-front"
+            echo "variant=max35-front-gc0308"
+            echo "flash_address=0x0"
+            echo "build_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > product/dist/BUILD_INFO.txt
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: MAX35-AURORA-Front-NoTouch-Firmware
+          path: product/dist/
+          if-no-files-found: error
+          retention-days: 30
